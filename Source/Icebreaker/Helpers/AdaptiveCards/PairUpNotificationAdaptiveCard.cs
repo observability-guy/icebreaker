@@ -48,7 +48,7 @@ namespace Icebreaker.Helpers.AdaptiveCards
 
             var meetingTitle = string.Format(Resources.MeetupTitle, senderGivenName, recipientGivenName);
             var meetingContent = string.Format(Resources.MeetupContent, botDisplayName);
-            var meetingLink = "https://teams.microsoft.com/l/meeting/new?subject=" + Uri.EscapeDataString(meetingTitle) + "&attendees=" + recipientUpn + "&content=" + Uri.EscapeDataString(meetingContent);
+            var meetingLink = "https://teams.microsoft.com/l/meeting/new?subject=" + Uri.EscapeDataString(meetingTitle) + "Icebreaker Meetup" + "&attendees=" + recipientUpn + "&content=" + Uri.EscapeDataString(meetingContent);
 
             var cardData = new
             {
