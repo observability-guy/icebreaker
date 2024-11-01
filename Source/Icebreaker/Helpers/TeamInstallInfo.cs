@@ -5,17 +5,19 @@
 
 namespace Icebreaker.Helpers
 {
-    using Microsoft.Azure.Documents;
+    using Microsoft.Azure.Cosmos;
     using Newtonsoft.Json;
 
     /// <summary>
     /// Represents information about a team to which the Icebreaker app was installed
     /// </summary>
-    public class TeamInstallInfo : Document
+    public class TeamInstallInfo
     {
+        [JsonProperty("id")]
+        public string Id { get; set; }
+
         /// <summary>
         /// Gets or sets the team id.
-        /// This is also the <see cref="Resource.Id"/>.
         /// </summary>
         [JsonIgnore]
         public string TeamId
