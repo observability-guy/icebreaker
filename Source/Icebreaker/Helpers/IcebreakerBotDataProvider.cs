@@ -2,24 +2,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 // </copyright>
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Icebreaker.Interfaces;
+using Microsoft.ApplicationInsights;
+using Microsoft.ApplicationInsights.DataContracts;
+using Microsoft.Azure;
+using Microsoft.Azure.Cosmos;
 
 namespace Icebreaker.Helpers
 {
-    using System;
-    using System.Collections.Generic;
-    using System.Linq;
-    using System.Threading.Tasks;
-    using Icebreaker.Interfaces;
-    using Microsoft.ApplicationInsights;
-    using Microsoft.ApplicationInsights.DataContracts;
-    using Microsoft.Azure;
-    using Microsoft.Azure.Documents;
-    using Microsoft.Azure.Documents.Client;
-    using Microsoft.Azure.Documents.Linq;
-
-    /// <summary>
-    /// Data provider routines
-    /// </summary>
     public class IcebreakerBotDataProvider : IBotDataProvider
     {
         // Request the minimum throughput by default
@@ -28,10 +21,10 @@ namespace Icebreaker.Helpers
         private readonly TelemetryClient telemetryClient;
         private readonly Lazy<Task> initializeTask;
         private readonly ISecretsHelper secretsHelper;
-        private DocumentClient documentClient;
+        private CosmosClient cosmosClient;
         private Database database;
-        private DocumentCollection teamsCollection;
-        private DocumentCollection usersCollection;
+        private Container teamsContainer;
+        private Container usersContainer;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="IcebreakerBotDataProvider"/> class.
@@ -57,12 +50,11 @@ namespace Icebreaker.Helpers
 
             if (installed)
             {
-                await this.documentClient.UpsertDocumentAsync(this.teamsCollection.SelfLink, team);
+                await this.teamsContainer.UpsertItemAsync(team, new PartitionKey(team.Id));
             }
             else
             {
-                var documentUri = UriFactory.CreateDocumentUri(this.database.Id, this.teamsCollection.Id, team.Id);
-                await this.documentClient.DeleteDocumentAsync(documentUri, new RequestOptions { PartitionKey = new PartitionKey(team.Id) });
+                await this.teamsContainer.DeleteItemAsync<TeamInstallInfo>(team.Id, new PartitionKey(team.Id));
             }
         }
 
@@ -78,15 +70,11 @@ namespace Icebreaker.Helpers
 
             try
             {
-                using (var lookupQuery = this.documentClient
-                    .CreateDocumentQuery<TeamInstallInfo>(this.teamsCollection.SelfLink, new FeedOptions { EnableCrossPartitionQuery = true })
-                    .AsDocumentQuery())
+                var query = this.teamsContainer.GetItemQueryIterator<TeamInstallInfo>(new QueryDefinition("SELECT * FROM c"));
+                while (query.HasMoreResults)
                 {
-                    while (lookupQuery.HasMoreResults)
-                    {
-                        var response = await lookupQuery.ExecuteNextAsync<TeamInstallInfo>();
-                        installedTeams.AddRange(response);
-                    }
+                    var response = await query.ReadNextAsync();
+                    installedTeams.AddRange(response);
                 }
             }
             catch (Exception ex)
@@ -106,11 +94,10 @@ namespace Icebreaker.Helpers
         {
             await this.EnsureInitializedAsync();
 
-            // Get team install info
             try
             {
-                var documentUri = UriFactory.CreateDocumentUri(this.database.Id, this.teamsCollection.Id, teamId);
-                return await this.documentClient.ReadDocumentAsync<TeamInstallInfo>(documentUri, new RequestOptions { PartitionKey = new PartitionKey(teamId) });
+                var response = await this.teamsContainer.ReadItemAsync<TeamInstallInfo>(teamId, new PartitionKey(teamId));
+                return response.Resource;
             }
             catch (Exception ex)
             {
@@ -130,8 +117,8 @@ namespace Icebreaker.Helpers
 
             try
             {
-                var documentUri = UriFactory.CreateDocumentUri(this.database.Id, this.usersCollection.Id, userId);
-                return await this.documentClient.ReadDocumentAsync<UserInfo>(documentUri, new RequestOptions { PartitionKey = new PartitionKey(userId) });
+                var response = await this.usersContainer.ReadItemAsync<UserInfo>(userId, new PartitionKey(userId));
+                return response.Resource;
             }
             catch (Exception ex)
             {
@@ -150,29 +137,14 @@ namespace Icebreaker.Helpers
 
             try
             {
-                var collectionLink = UriFactory.CreateDocumentCollectionUri(this.database.Id, this.usersCollection.Id);
-                var query = this.documentClient.CreateDocumentQuery<UserInfo>(
-                        collectionLink,
-                        new FeedOptions
-                        {
-                            EnableCrossPartitionQuery = true,
-
-                            // Fetch items in bulk according to DB engine capability
-                            MaxItemCount = -1,
-
-                            // Max partition to query at a time
-                            MaxDegreeOfParallelism = -1,
-                        })
-                    .Select(u => new UserInfo { Id = u.Id, OptedIn = u.OptedIn })
-                    .AsDocumentQuery();
+                var query = this.usersContainer.GetItemQueryIterator<UserInfo>(new QueryDefinition("SELECT c.id, c.optedIn FROM c"));
                 var usersOptInStatusLookup = new Dictionary<string, bool>();
                 while (query.HasMoreResults)
                 {
-                    // Note that ExecuteNextAsync can return many records in each call
-                    var responseBatch = await query.ExecuteNextAsync<UserInfo>();
+                    var responseBatch = await query.ReadNextAsync();
                     foreach (var userInfo in responseBatch)
                     {
-                        usersOptInStatusLookup.Add(userInfo.Id, userInfo.OptedIn);
+                        usersOptInStatusLookup.Add(userInfo.UserId, userInfo.OptedIn);
                     }
                 }
 
@@ -204,7 +176,7 @@ namespace Icebreaker.Helpers
                 OptedIn = optedIn,
                 ServiceUrl = serviceUrl,
             };
-            await this.documentClient.UpsertDocumentAsync(this.usersCollection.SelfLink, userInfo);
+            await this.usersContainer.UpsertItemAsync(userInfo, new PartitionKey(userId));
         }
 
         /// <summary>
@@ -220,46 +192,36 @@ namespace Icebreaker.Helpers
             var teamsCollectionName = CloudConfigurationManager.GetSetting("CosmosCollectionTeams");
             var usersCollectionName = CloudConfigurationManager.GetSetting("CosmosCollectionUsers");
 
-            this.documentClient = new DocumentClient(new Uri(endpointUrl), this.secretsHelper.CosmosDBKey);
+            this.cosmosClient = new CosmosClient(endpointUrl, this.secretsHelper.CosmosDBKey);
 
-            var requestOptions = new RequestOptions { OfferThroughput = DefaultRequestThroughput };
             bool useSharedOffer = true;
 
             // Create the database if needed
             try
             {
-                this.database = await this.documentClient.CreateDatabaseIfNotExistsAsync(new Database { Id = databaseName }, requestOptions);
+                this.database = await this.cosmosClient.CreateDatabaseIfNotExistsAsync(databaseName, DefaultRequestThroughput);
             }
-            catch (DocumentClientException ex)
+            catch (CosmosException ex) when (ex.StatusCode == System.Net.HttpStatusCode.BadRequest && ex.Message.Contains("SharedOffer is Disabled"))
             {
-                if (ex.Error?.Message?.Contains("SharedOffer is Disabled") ?? false)
-                {
-                    this.telemetryClient.TrackTrace("Database shared offer is disabled for the account, will provision throughput at container level", SeverityLevel.Information);
-                    useSharedOffer = false;
+                this.telemetryClient.TrackTrace("Database shared offer is disabled for the account, will provision throughput at container level", SeverityLevel.Information);
+                useSharedOffer = false;
 
-                    this.database = await this.documentClient.CreateDatabaseIfNotExistsAsync(new Database { Id = databaseName });
-                }
-                else
-                {
-                    throw;
-                }
+                this.database = await this.cosmosClient.CreateDatabaseIfNotExistsAsync(databaseName);
             }
 
-            // Get a reference to the Teams collection, creating it if needed
-            var teamsCollectionDefinition = new DocumentCollection
+            // Get a reference to the Teams container, creating it if needed
+            teamsContainer = await this.database.CreateContainerIfNotExistsAsync(new ContainerProperties
             {
                 Id = teamsCollectionName,
-            };
-            teamsCollectionDefinition.PartitionKey.Paths.Add("/id");
-            this.teamsCollection = await this.documentClient.CreateDocumentCollectionIfNotExistsAsync(this.database.SelfLink, teamsCollectionDefinition, useSharedOffer ? null : requestOptions);
+                PartitionKeyPath = "/id"
+            }, useSharedOffer ? DefaultRequestThroughput : (int?)null);
 
-            // Get a reference to the Users collection, creating it if needed
-            var usersCollectionDefinition = new DocumentCollection
+            // Get a reference to the Users container, creating it if needed
+            usersContainer = await this.database.CreateContainerIfNotExistsAsync(new ContainerProperties
             {
                 Id = usersCollectionName,
-            };
-            usersCollectionDefinition.PartitionKey.Paths.Add("/id");
-            this.usersCollection = await this.documentClient.CreateDocumentCollectionIfNotExistsAsync(this.database.SelfLink, usersCollectionDefinition, useSharedOffer ? null : requestOptions);
+                PartitionKeyPath = "/id"
+            }, useSharedOffer ? DefaultRequestThroughput : (int?)null);
 
             this.telemetryClient.TrackTrace("Data store initialized");
         }
